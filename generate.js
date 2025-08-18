@@ -200,6 +200,7 @@ const path = require('path');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
 const ffmpegStatic = require('ffmpeg-static'); // <-- 1. IMPORT FFMPEG-STATIC
+require('dotenv').config();
 
 // --- Google Sheet Configuration ---
 // The ID of your Google Sheet (from the URL)
@@ -208,8 +209,8 @@ const credentials = require('./google-credentials.json');
 
 // Initialize auth - this is the modern syntax for google-spreadsheet v4
 const serviceAccountAuth = new JWT({
-  email: credentials.client_email,
-  key: credentials.private_key,
+  email: process.env.GOOGLE_CLIENT_EMAIL,
+  key: process.env.GOOGLE_PRIVATE_KEY,
   scopes: [
     'https://www.googleapis.com/auth/spreadsheets',
   ],
