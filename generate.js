@@ -205,7 +205,7 @@ require('dotenv').config();
 // --- Google Sheet Configuration ---
 // The ID of your Google Sheet (from the URL)
 const SPREADSHEET_ID = '1oPWMm-QLAvNVS3-61Y4lSBa32KQSthc2HziDVcQ8cxU'; // Your verified Sheet ID
-const credentials = require('./google-credentials.json');
+// const credentials = require('./google-credentials.json');
 
 // Initialize auth - this is the modern syntax for google-spreadsheet v4
 const serviceAccountAuth = new JWT({
