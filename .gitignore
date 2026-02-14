@@ -1,4 +1,4 @@
 # .gitignore
 node_modules
 .env
-google-credentials.json
+google-sheets.json
