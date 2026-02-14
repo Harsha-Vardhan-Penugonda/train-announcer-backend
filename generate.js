@@ -1,15 +1,3 @@
-/*
-================================================================================
-|                                                                              |
-|   File: generate.js (Google Sheets Version)                                  |
-|   Description: Contains the core logic for generating the announcement.      |
-|                It fetches train data from a Google Sheet and uses FFmpeg     |
-|                to stitch the audio files together.                           |
-|   FIX: Updated to use modern google-spreadsheet (v4) syntax.                 |
-|                                                                              |
-================================================================================
-*/
-
 const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
