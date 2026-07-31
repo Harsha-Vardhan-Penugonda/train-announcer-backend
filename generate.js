@@ -7,7 +7,16 @@ const Train = require('./models/Train');
 const AudioClip = require('./models/AudioClip');
 
 const audioFilesDir = path.join(__dirname, 'audio_files');
-const SILENCE_CLIP = path.join(audioFilesDir, '_silence.mp3');
+
+// Strips every silence gap in the final merged announcement - leading,
+// trailing, and anything left between clips (some legacy source files still
+// carry their own internal padding since they were only denoised, never
+// silence-trimmed). No pauses are inserted between clips; this filter's job
+// is purely to remove whatever silence already exists, not add any.
+const SILENCE_STRIP_FILTER = [
+    'silenceremove=start_periods=1:start_duration=0:start_threshold=-30dB:detection=peak',
+    'silenceremove=stop_periods=-1:stop_duration=0.03:stop_threshold=-30dB:detection=peak',
+].join(',');
 
 const audioCacheDir = path.join(os.tmpdir(), 'rly-audio-cache');
 if (!fs.existsSync(audioCacheDir)) fs.mkdirSync(audioCacheDir, { recursive: true });
@@ -154,14 +163,6 @@ const generateAnnouncement = async (req, res) => {
             return res.status(500).json({ error: "No audio available to build this announcement." });
         }
 
-        // Insert a short pause between every clip so the announcement doesn't
-        // sound like one rushed word - matches the cadence of real PA audio.
-        const withPauses = [];
-        validFiles.forEach((filePath, idx) => {
-            withPauses.push(filePath);
-            if (idx < validFiles.length - 1) withPauses.push(SILENCE_CLIP);
-        });
-
         // --- Use FFmpeg's concat FILTER (not the concat demuxer) to merge ---
         // The source clips are a mix of codecs/bitrates and some carry
         // inconsistent internal timestamps; the concat demuxer (-f concat)
@@ -177,9 +178,9 @@ const generateAnnouncement = async (req, res) => {
         const outputFileName = `SCR_${anncType.replace(/ /g, '')}_${trimmedTrainNumber}_${Date.now()}.mp3`;
         const outputFilePath = path.join(outputDir, outputFileName);
 
-        const inputArgs = withPauses.flatMap(filePath => ['-i', filePath]);
-        const filterInputs = withPauses.map((_, i) => `[${i}:a]`).join('');
-        const filterComplex = `${filterInputs}concat=n=${withPauses.length}:v=0:a=1[out]`;
+        const inputArgs = validFiles.flatMap(filePath => ['-i', filePath]);
+        const filterInputs = validFiles.map((_, i) => `[${i}:a]`).join('');
+        const filterComplex = `${filterInputs}concat=n=${validFiles.length}:v=0:a=1[concatenated];[concatenated]${SILENCE_STRIP_FILTER}[out]`;
 
         const args = [
             '-y',
