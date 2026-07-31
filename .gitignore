@@ -2,3 +2,7 @@
 node_modules
 .env
 google-sheets.json
+google-credentials.json
+
+# Generated at runtime, not source
+public/announcements/

@@ -5,6 +5,7 @@ const mongoose = require('mongoose');
 require('dotenv').config(); // Loads variables from .env file
 
 const { generateAnnouncement } = require('./generate.js');
+const audioClipsRouter = require('./audioClips.js');
 
 // Initialize the Express app
 const app = express();
@@ -34,6 +35,9 @@ app.get('/', (req, res) => {
 
 // The main API route for generating announcements. It calls the function from generate.js
 app.post('/api/generate', generateAnnouncement);
+
+// Routes for the admin/voice-artist audio recording workflow
+app.use('/api/audio-clips', audioClipsRouter);
 
 
 // --- Start the Server ---

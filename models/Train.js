@@ -8,10 +8,10 @@ const trainSchema = new mongoose.Schema({
     'Train No': { type: mongoose.Schema.Types.Mixed, required: true, unique: true },
 
     // These fields from your CSV have inconsistent casing, so we match them here.
-    'Train Name': { type: String, required: true },
-    'FROM': { type: String }, // Corresponds to 'From' in your data
-    'TO': { type: String },   // Corresponds to 'To' in your data
-    'train type': { type: String } // Corresponds to 'Train Type' in your data
+    'Train Name': { type: String },
+    'FROM': { type: String },
+    'TO': { type: String },
+    'Train Type': { type: String }
 }, {
     // This option allows for fields not strictly defined in the schema
     // which can help with inconsistent CSV headers.
