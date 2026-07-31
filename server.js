@@ -6,6 +6,7 @@ require('dotenv').config(); // Loads variables from .env file
 
 const { generateAnnouncement } = require('./generate.js');
 const audioClipsRouter = require('./audioClips.js');
+const trainsRouter = require('./trains.js');
 
 // Initialize the Express app
 const app = express();
@@ -38,6 +39,9 @@ app.post('/api/generate', generateAnnouncement);
 
 // Routes for the admin/voice-artist audio recording workflow
 app.use('/api/audio-clips', audioClipsRouter);
+
+// Routes for adding new trains
+app.use('/api/trains', trainsRouter);
 
 
 // --- Start the Server ---
