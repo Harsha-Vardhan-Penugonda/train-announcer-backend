@@ -15,7 +15,7 @@ const audioFilesDir = path.join(__dirname, 'audio_files');
 // is purely to remove whatever silence already exists, not add any.
 const SILENCE_STRIP_FILTER = [
     'silenceremove=start_periods=1:start_duration=0:start_threshold=-30dB:detection=peak',
-    'silenceremove=stop_periods=-1:stop_duration=0.03:stop_threshold=-30dB:detection=peak',
+    'silenceremove=stop_periods=-1:stop_duration=0.1:stop_threshold=-30dB:detection=peak',
 ].join(',');
 
 const audioCacheDir = path.join(os.tmpdir(), 'rly-audio-cache');
