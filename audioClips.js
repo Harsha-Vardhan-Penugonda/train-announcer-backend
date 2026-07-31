@@ -186,9 +186,13 @@ router.delete('/:key', async (req, res) => {
     res.status(204).send();
 });
 
-// POST /api/audio-clips/:key/enhance - upload a raw recording (mic or file);
-// it gets silence-trimmed, denoised, normalized, and saved as the live clip.
-// Used both by the mic-recording flow and the dashboard's "replace" upload.
+// POST /api/audio-clips/:key/enhance - upload a recording (mic or file); by
+// default it gets silence-trimmed, denoised, normalized, and saved as the
+// live clip. Pass skipProcessing=true when the audio was already processed
+// client-side (e.g. RecordPage's ffmpeg.wasm pipeline) - the upload is then
+// just re-encoded to a consistent MP3 container/bitrate and stored as-is, so
+// what the user previewed is exactly what gets saved rather than being run
+// through a second, possibly different, filter pass.
 router.post('/:key/enhance', upload.single('audio'), async (req, res) => {
     const { key } = req.params;
     if (!req.file) {
@@ -203,12 +207,31 @@ router.post('/:key/enhance', upload.single('audio'), async (req, res) => {
     try {
         fs.writeFileSync(inputPath, req.file.buffer);
 
-        const minSilenceSeconds = parseMinSilence(req.body.minSilenceSeconds);
-        const filter = buildEnhanceFilter(minSilenceSeconds);
-        await runFfmpeg(['-y', '-i', inputPath, '-af', filter, '-c:a', 'libmp3lame', '-b:a', '128k', outputPath]);
+        const skipProcessing = req.body.skipProcessing === 'true';
+        const { durationSeconds: inputDurationSeconds } = await getAudioMetadata(inputPath);
+
+        let minSilenceSeconds = null;
+        if (skipProcessing) {
+            await runFfmpeg(['-y', '-i', inputPath, '-c:a', 'libmp3lame', '-b:a', '128k', outputPath]);
+        } else {
+            minSilenceSeconds = parseMinSilence(req.body.minSilenceSeconds);
+            const filter = buildEnhanceFilter(minSilenceSeconds);
+            await runFfmpeg(['-y', '-i', inputPath, '-af', filter, '-c:a', 'libmp3lame', '-b:a', '128k', outputPath]);
+        }
 
         const enhancedBuffer = fs.readFileSync(outputPath);
         const { durationSeconds } = await getAudioMetadata(outputPath);
+
+        // Silence removal on a very quiet/soft recording can strip almost
+        // everything, leaving a broken near-empty file that "succeeds" but
+        // won't actually play. Catch that instead of silently saving it.
+        const inputHadRealAudio = inputDurationSeconds && inputDurationSeconds > 0.3;
+        const outputCollapsed = !durationSeconds || durationSeconds < 0.15;
+        if (inputHadRealAudio && outputCollapsed) {
+            return res.status(422).json({
+                error: 'Processing removed almost all of the audio - the recording may be too quiet, or the silence-trim setting is too aggressive. Try recording again closer to the mic, or use a gentler silence-trim setting.',
+            });
+        }
 
         const existing = await AudioClip.findOne({ key });
         const nextVersion = (existing?.version || 0) + 1;
