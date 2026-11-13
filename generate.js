@@ -5,6 +5,7 @@ const path = require('path');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
 const Train = require('./models/Train');
 const AudioClip = require('./models/AudioClip');
+const { toBuffer } = require('./toBuffer');
 
 const audioFilesDir = path.join(__dirname, 'audio_files');
 
@@ -21,6 +22,11 @@ const SILENCE_STRIP_FILTER = [
 const audioCacheDir = path.join(os.tmpdir(), 'rly-audio-cache');
 if (!fs.existsSync(audioCacheDir)) fs.mkdirSync(audioCacheDir, { recursive: true });
 
+// MongoDB is back in sync with the (now fixed) disk files as of
+// sync-disk-to-mongo.js, so it's safe to read from again - a re-recorded
+// clip there wins over the legacy file on disk, which is the whole point.
+const USE_MONGO_AUDIO = true;
+
 // --- Database Function (reads from MongoDB) ---
 const getTrainDetails = async (trainNo) => {
     const trainDoc = await Train.findOne({ 'Train No': String(trainNo) }).lean();
@@ -36,14 +42,17 @@ const getTrainDetails = async (trainNo) => {
 };
 
 // Resolves a logical audio key (e.g. "Vijayawada Junction", "4_tel") to a real
-// file path. A re-recorded clip in MongoDB always wins over the legacy file
-// on disk, since that's the whole point of the re-recording workflow.
+// file path. When USE_MONGO_AUDIO is on, a re-recorded clip in MongoDB wins
+// over the legacy file on disk (the point of the re-recording workflow);
+// while it's off, disk is the only source consulted.
 const resolveAudioKey = async (key) => {
-    const clip = await AudioClip.findOne({ key, status: 'recorded' }).lean();
-    if (clip && clip.audioData) {
-        const cachedPath = path.join(audioCacheDir, `${key}.mp3`);
-        fs.writeFileSync(cachedPath, clip.audioData.buffer ? Buffer.from(clip.audioData.buffer) : clip.audioData);
-        return cachedPath;
+    if (USE_MONGO_AUDIO) {
+        const clip = await AudioClip.findOne({ key, status: 'recorded' }).lean();
+        if (clip && clip.audioData) {
+            const cachedPath = path.join(audioCacheDir, `${key}.mp3`);
+            fs.writeFileSync(cachedPath, toBuffer(clip.audioData));
+            return cachedPath;
+        }
     }
 
     const diskPath = path.join(audioFilesDir, `${key}.mp3`);
