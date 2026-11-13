@@ -26,22 +26,28 @@ async function ensureAudioClip(key, category) {
     };
 }
 
-// GET /api/trains/field-options - real distinct values already in use, so the
+// GET /api/trains/field-options - distinct values in use or recorded, so the
 // Add Train form can suggest reusing existing station/name/type audio instead
 // of accidentally creating a near-duplicate under a slightly different key.
 router.get('/field-options', async (req, res) => {
-    const [fromValues, toValues, trainNames, trainTypes] = await Promise.all([
+    // Audio clips created on the dashboard count too, so a name recorded
+    // there shows up here before any train uses it.
+    const clipKeys = (category) => AudioClip.distinct('key', { category, status: { $ne: 'archived' } });
+    const [fromValues, toValues, trainNames, trainTypes, stationClips, nameClips, typeClips] = await Promise.all([
         Train.distinct('FROM'),
         Train.distinct('TO'),
         Train.distinct('Train Name'),
         Train.distinct('Train Type'),
+        clipKeys('Station Name'),
+        clipKeys('Train Name'),
+        clipKeys('Train Type'),
     ]);
 
-    const stations = Array.from(new Set([...fromValues, ...toValues].filter(Boolean))).sort();
+    const merge = (...lists) => Array.from(new Set(lists.flat().filter(Boolean))).sort();
     res.json({
-        stations,
-        trainNames: trainNames.filter(Boolean).sort(),
-        trainTypes: trainTypes.filter(Boolean).sort(),
+        stations: merge(fromValues, toValues, stationClips),
+        trainNames: merge(trainNames, nameClips),
+        trainTypes: merge(trainTypes, typeClips),
     });
 });
 
