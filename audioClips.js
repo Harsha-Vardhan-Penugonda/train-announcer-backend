@@ -9,6 +9,7 @@ const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
 const AudioClip = require('./models/AudioClip');
 const Train = require('./models/Train');
 const { getAudioMetadata } = require('./audioMetadata');
+const { matchLoudness } = require('./loudness');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -19,28 +20,13 @@ const SORTABLE_FIELDS = ['key', 'status', 'category', 'durationSeconds', 'fileSi
 const DEFAULT_MIN_SILENCE = 0.2; // seconds - a pause shorter than this is left alone
 const MIN_SILENCE_FLOOR = 0.05;  // most aggressive the slider allows
 const MIN_SILENCE_CEILING = 1.5; // gentlest the slider allows
-// -0.4dB is where the original digit/phrase clips (daya_chesi, kindAttention,
-// 0-9 in all 3 languages) actually peak - matching it exactly is what makes
-// everything sound consistent.
-const TARGET_PEAK_DB = -0.4;
-// Every libmp3lame encode pass shifts the decoded peak down by ~0.4dB from
-// whatever the pre-encode gain math predicts (lossy reconstruction filter
-// overshoot - confirmed by re-encoding a file at 0dB gain and watching its
-// measured peak drop anyway). Compensate for it up front in the one encode
-// pass below rather than re-encoding again to "correct" it, which just
-// introduces the same shift a second time and cancels itself out.
-const ENCODE_SHIFT_COMPENSATION_DB = 0.4;
-
 // Strips leading silence, then every remaining silence gap anywhere in the
 // rest of the clip (stop_periods=-1 means "don't stop after the first one" -
 // mid-recording pauses and trailing silence are both removed this way), then
 // reduces background noise. `minSilenceSeconds` is the "how much silence to
 // trim" knob: lower = more aggressive (even brief pauses get cut), higher =
-// gentler (only long dead air gets cut). Loudness normalization is applied
-// separately afterward (see normalizeToPeak) - loudnorm's single-pass EBU
-// R128 algorithm needs several seconds of audio to work with, and these are
-// mostly 1-2s single-word clips, so it was silently a near no-op on exactly
-// the files that most needed it.
+// gentler (only long dead air gets cut). Loudness is matched separately
+// afterward (see matchLoudness in loudness.js).
 function buildEnhanceFilter(minSilenceSeconds) {
     return [
         `silenceremove=start_periods=1:start_duration=0:start_threshold=-35dB:detection=peak`,
@@ -62,49 +48,6 @@ function runFfmpeg(args) {
             resolve(stderr);
         });
     });
-}
-
-// Measures the true peak of a file via ffmpeg's volumedetect filter. Works
-// reliably regardless of clip length, unlike loudnorm's integrated-loudness
-// measurement - this is a simple "how loud is the loudest sample" reading.
-// If the prior silence-removal stage stripped a clip down to nothing (can
-// happen on a very quiet/steady recording), ffmpeg can't even read it back -
-// treat that the same as digital silence rather than letting it throw, so
-// the existing "recording is too quiet" 422 downstream gets a chance to
-// report it cleanly instead of a generic 500.
-async function measurePeakDb(filePath) {
-    let stderr;
-    try {
-        stderr = await runFfmpeg(['-i', filePath, '-af', 'volumedetect', '-f', 'null', '-']);
-    } catch {
-        return null;
-    }
-    const match = stderr.match(/max_volume:\s*(-?[\d.]+|-inf)\s*dB/);
-    if (!match || match[1] === '-inf') return null; // digital silence - nothing to normalize
-    return parseFloat(match[1]);
-}
-
-// Boosts (or trims) a clip so its peak lands exactly at TARGET_PEAK_DB,
-// regardless of duration - a plain gain adjustment based on a real
-// measurement, rather than loudnorm's duration-sensitive loudness estimate.
-async function normalizeToPeak(inputPath, outputPath) {
-    const peakDb = await measurePeakDb(inputPath);
-    if (peakDb === null) {
-        // Either genuine digital silence, or (measurePeakDb already caught
-        // this) an unreadable/collapsed file from the silence-removal stage.
-        // Either way there's nothing sensible to normalize - just try to
-        // pass it through as-is; if the input is too broken even for that,
-        // let it fail here so the outer route handler's catch reports a
-        // clean 500 rather than this function silently producing garbage.
-        try {
-            await runFfmpeg(['-y', '-i', inputPath, '-c:a', 'libmp3lame', '-b:a', '128k', outputPath]);
-        } catch {
-            fs.copyFileSync(inputPath, outputPath);
-        }
-        return;
-    }
-    const gainDb = (TARGET_PEAK_DB - peakDb) + ENCODE_SHIFT_COMPENSATION_DB;
-    await runFfmpeg(['-y', '-i', inputPath, '-af', `volume=${gainDb}dB`, '-c:a', 'libmp3lame', '-b:a', '128k', outputPath]);
 }
 
 function escapeRegex(str) {
@@ -244,12 +187,12 @@ router.delete('/:key', async (req, res) => {
 });
 
 // POST /api/audio-clips/:key/enhance - upload a recording (mic or file); by
-// default it gets silence-trimmed, denoised, normalized, and saved as the
+// default it gets silence-trimmed, denoised, loudness-matched, and saved as the
 // live clip. Pass skipProcessing=true when the audio was already processed
-// client-side (e.g. RecordPage's ffmpeg.wasm pipeline) - the upload is then
-// just re-encoded to a consistent MP3 container/bitrate and stored as-is, so
-// what the user previewed is exactly what gets saved rather than being run
-// through a second, possibly different, filter pass.
+// client-side (e.g. RecordPage's ffmpeg.wasm pipeline) - the upload then
+// skips noise reduction and silence removal and only gets the loudness
+// match, which the client applies too, so what the user previewed is
+// what gets saved.
 router.post('/:key/enhance', upload.single('audio'), async (req, res) => {
     const { key } = req.params;
     if (!req.file) {
@@ -270,13 +213,15 @@ router.post('/:key/enhance', upload.single('audio'), async (req, res) => {
 
         let minSilenceSeconds = null;
         if (skipProcessing) {
-            // Already processed (and normalized) client-side - just re-encode
-            // to a consistent container/bitrate, no further gain changes. If
-            // the upload itself is malformed (e.g. a near-empty result from
-            // a client-side processing bug), fail with the same clear 422
-            // below instead of a raw ffmpeg crash surfacing as a generic 500.
+            // Already cleaned up client-side. Still run the loudness match:
+            // it makes the clip mono and as loud as the rest even if this
+            // upload came from an older page that skipped those steps, and
+            // a clip that already matches gets no further change. If the
+            // upload itself is malformed (e.g. a near-empty result from a
+            // client-side processing bug), fail with a clear 422 instead of
+            // a raw ffmpeg crash surfacing as a generic 500.
             try {
-                await runFfmpeg(['-y', '-i', inputPath, '-c:a', 'libmp3lame', '-b:a', '128k', outputPath]);
+                await matchLoudness(inputPath, outputPath);
             } catch {
                 return res.status(422).json({
                     error: 'Could not process the uploaded audio - the file may be empty or corrupted. Try recording again.',
@@ -286,7 +231,14 @@ router.post('/:key/enhance', upload.single('audio'), async (req, res) => {
             minSilenceSeconds = parseMinSilence(req.body.minSilenceSeconds);
             const filter = buildEnhanceFilter(minSilenceSeconds);
             await runFfmpeg(['-y', '-i', inputPath, '-af', filter, '-c:a', 'libmp3lame', '-b:a', '128k', intermediatePath]);
-            await normalizeToPeak(intermediatePath, outputPath);
+            try {
+                await matchLoudness(intermediatePath, outputPath);
+            } catch {
+                // Silence removal stripped the clip to nothing readable -
+                // pass it through so the "removed almost all of the audio"
+                // 422 below reports it.
+                fs.copyFileSync(intermediatePath, outputPath);
+            }
         }
 
         const enhancedBuffer = fs.readFileSync(outputPath);
