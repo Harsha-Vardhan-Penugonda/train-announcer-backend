@@ -9,6 +9,7 @@ const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
 const AudioClip = require('./models/AudioClip');
 const Train = require('./models/Train');
 const { getAudioMetadata } = require('./audioMetadata');
+const { matchLoudness } = require('./loudness');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -19,19 +20,18 @@ const SORTABLE_FIELDS = ['key', 'status', 'category', 'durationSeconds', 'fileSi
 const DEFAULT_MIN_SILENCE = 0.2; // seconds - a pause shorter than this is left alone
 const MIN_SILENCE_FLOOR = 0.05;  // most aggressive the slider allows
 const MIN_SILENCE_CEILING = 1.5; // gentlest the slider allows
-
 // Strips leading silence, then every remaining silence gap anywhere in the
 // rest of the clip (stop_periods=-1 means "don't stop after the first one" -
 // mid-recording pauses and trailing silence are both removed this way), then
-// reduces background noise, then normalizes loudness. `minSilenceSeconds` is
-// the "how much silence to trim" knob: lower = more aggressive (even brief
-// pauses get cut), higher = gentler (only long dead air gets cut).
+// reduces background noise. `minSilenceSeconds` is the "how much silence to
+// trim" knob: lower = more aggressive (even brief pauses get cut), higher =
+// gentler (only long dead air gets cut). Loudness is matched separately
+// afterward (see matchLoudness in loudness.js).
 function buildEnhanceFilter(minSilenceSeconds) {
     return [
         `silenceremove=start_periods=1:start_duration=0:start_threshold=-35dB:detection=peak`,
         `silenceremove=stop_periods=-1:stop_duration=${minSilenceSeconds}:stop_threshold=-35dB:detection=peak`,
         'afftdn=nf=-25:nr=12',
-        'loudnorm=I=-16:TP=-1.5:LRA=11',
     ].join(',');
 }
 
@@ -45,7 +45,7 @@ function runFfmpeg(args) {
     return new Promise((resolve, reject) => {
         execFile(ffmpegPath, args, (error, stdout, stderr) => {
             if (error) return reject(new Error(stderr || error.message));
-            resolve();
+            resolve(stderr);
         });
     });
 }
@@ -187,12 +187,12 @@ router.delete('/:key', async (req, res) => {
 });
 
 // POST /api/audio-clips/:key/enhance - upload a recording (mic or file); by
-// default it gets silence-trimmed, denoised, normalized, and saved as the
+// default it gets silence-trimmed, denoised, loudness-matched, and saved as the
 // live clip. Pass skipProcessing=true when the audio was already processed
-// client-side (e.g. RecordPage's ffmpeg.wasm pipeline) - the upload is then
-// just re-encoded to a consistent MP3 container/bitrate and stored as-is, so
-// what the user previewed is exactly what gets saved rather than being run
-// through a second, possibly different, filter pass.
+// client-side (e.g. RecordPage's ffmpeg.wasm pipeline) - the upload then
+// skips noise reduction and silence removal and only gets the loudness
+// match, which the client applies too, so what the user previewed is
+// what gets saved.
 router.post('/:key/enhance', upload.single('audio'), async (req, res) => {
     const { key } = req.params;
     if (!req.file) {
@@ -202,6 +202,7 @@ router.post('/:key/enhance', upload.single('audio'), async (req, res) => {
     const tmpDir = os.tmpdir();
     const token = crypto.randomBytes(6).toString('hex');
     const inputPath = path.join(tmpDir, `rec_${token}_in`);
+    const intermediatePath = path.join(tmpDir, `rec_${token}_mid.mp3`);
     const outputPath = path.join(tmpDir, `rec_${token}_out.mp3`);
 
     try {
@@ -212,11 +213,32 @@ router.post('/:key/enhance', upload.single('audio'), async (req, res) => {
 
         let minSilenceSeconds = null;
         if (skipProcessing) {
-            await runFfmpeg(['-y', '-i', inputPath, '-c:a', 'libmp3lame', '-b:a', '128k', outputPath]);
+            // Already cleaned up client-side. Still run the loudness match:
+            // it makes the clip mono and as loud as the rest even if this
+            // upload came from an older page that skipped those steps, and
+            // a clip that already matches gets no further change. If the
+            // upload itself is malformed (e.g. a near-empty result from a
+            // client-side processing bug), fail with a clear 422 instead of
+            // a raw ffmpeg crash surfacing as a generic 500.
+            try {
+                await matchLoudness(inputPath, outputPath);
+            } catch {
+                return res.status(422).json({
+                    error: 'Could not process the uploaded audio - the file may be empty or corrupted. Try recording again.',
+                });
+            }
         } else {
             minSilenceSeconds = parseMinSilence(req.body.minSilenceSeconds);
             const filter = buildEnhanceFilter(minSilenceSeconds);
-            await runFfmpeg(['-y', '-i', inputPath, '-af', filter, '-c:a', 'libmp3lame', '-b:a', '128k', outputPath]);
+            await runFfmpeg(['-y', '-i', inputPath, '-af', filter, '-c:a', 'libmp3lame', '-b:a', '128k', intermediatePath]);
+            try {
+                await matchLoudness(intermediatePath, outputPath);
+            } catch {
+                // Silence removal stripped the clip to nothing readable -
+                // pass it through so the "removed almost all of the audio"
+                // 422 below reports it.
+                fs.copyFileSync(intermediatePath, outputPath);
+            }
         }
 
         const enhancedBuffer = fs.readFileSync(outputPath);
@@ -258,6 +280,7 @@ router.post('/:key/enhance', upload.single('audio'), async (req, res) => {
         res.status(500).json({ error: 'Failed to process recording.' });
     } finally {
         fs.existsSync(inputPath) && fs.unlinkSync(inputPath);
+        fs.existsSync(intermediatePath) && fs.unlinkSync(intermediatePath);
         fs.existsSync(outputPath) && fs.unlinkSync(outputPath);
     }
 });

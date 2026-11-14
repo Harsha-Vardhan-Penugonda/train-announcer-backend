@@ -26,22 +26,28 @@ async function ensureAudioClip(key, category) {
     };
 }
 
-// GET /api/trains/field-options - real distinct values already in use, so the
+// GET /api/trains/field-options - distinct values in use or recorded, so the
 // Add Train form can suggest reusing existing station/name/type audio instead
 // of accidentally creating a near-duplicate under a slightly different key.
 router.get('/field-options', async (req, res) => {
-    const [fromValues, toValues, trainNames, trainTypes] = await Promise.all([
+    // Audio clips created on the dashboard count too, so a name recorded
+    // there shows up here before any train uses it.
+    const clipKeys = (category) => AudioClip.distinct('key', { category, status: { $ne: 'archived' } });
+    const [fromValues, toValues, trainNames, trainTypes, stationClips, nameClips, typeClips] = await Promise.all([
         Train.distinct('FROM'),
         Train.distinct('TO'),
         Train.distinct('Train Name'),
         Train.distinct('Train Type'),
+        clipKeys('Station Name'),
+        clipKeys('Train Name'),
+        clipKeys('Train Type'),
     ]);
 
-    const stations = Array.from(new Set([...fromValues, ...toValues].filter(Boolean))).sort();
+    const merge = (...lists) => Array.from(new Set(lists.flat().filter(Boolean))).sort();
     res.json({
-        stations,
-        trainNames: trainNames.filter(Boolean).sort(),
-        trainTypes: trainTypes.filter(Boolean).sort(),
+        stations: merge(fromValues, toValues, stationClips),
+        trainNames: merge(trainNames, nameClips),
+        trainTypes: merge(trainTypes, typeClips),
     });
 });
 
@@ -66,54 +72,93 @@ router.get('/', async (req, res) => {
     res.json({ items, total, page: pageNum, limit: limitNum, totalPages: Math.max(1, Math.ceil(total / limitNum)) });
 });
 
-// POST /api/trains - add a new train, and make sure every audio key it needs
-// (from/to/name/type) exists in AudioClip - as 'recorded' if it's already
-// there, or freshly created as 'pending' so it shows up in the recording
-// queue if it's genuinely new.
-router.post('/', async (req, res) => {
-    const { trainNo, trainName, from, to, trainType } = req.body;
+// GET /api/trains/suggest?prefix=127 - trains whose number starts with the
+// typed digits, for the Generator page's live lookup. Anchored regex on the
+// indexed 'Train No' field, so it stays fast as the list grows.
+router.get('/suggest', async (req, res) => {
+    const prefix = String(req.query.prefix || '').trim();
+    if (!prefix) return res.json([]);
+    const items = await Train.find({ 'Train No': { $regex: '^' + escapeRegex(prefix) } })
+        .sort({ 'Train No': 1 })
+        .limit(8)
+        .lean();
+    res.json(items);
+});
 
-    if (!trainNo || !String(trainNo).trim()) {
-        return res.status(400).json({ error: 'trainNo is required' });
-    }
+// Validates and trims an add/edit request body. Returns { error } or { fields }.
+function parseTrainBody(body) {
+    const { trainNo, trainName, from, to, trainType } = body || {};
+    if (!trainNo || !String(trainNo).trim()) return { error: 'trainNo is required' };
     if (!from || !String(from).trim() || !to || !String(to).trim()) {
-        return res.status(400).json({ error: 'from and to stations are required' });
+        return { error: 'from and to stations are required' };
     }
+    return {
+        fields: {
+            'Train No': String(trainNo).trim(),
+            'Train Name': trainName && String(trainName).trim() ? String(trainName).trim() : null,
+            'FROM': String(from).trim(),
+            'TO': String(to).trim(),
+            'Train Type': trainType && String(trainType).trim() ? String(trainType).trim() : null,
+        },
+    };
+}
 
-    const trimmedTrainNo = String(trainNo).trim();
-
-    const existing = await Train.findOne({ 'Train No': trimmedTrainNo });
-    if (existing) {
-        return res.status(409).json({ error: `Train ${trimmedTrainNo} already exists.` });
-    }
-
-    const trimmedFrom = String(from).trim();
-    const trimmedTo = String(to).trim();
-    const trimmedName = trainName ? String(trainName).trim() : null;
-    const trimmedType = trainType ? String(trainType).trim() : null;
-
-    const train = await Train.create({
-        'Train No': trimmedTrainNo,
-        'Train Name': trimmedName,
-        'FROM': trimmedFrom,
-        'TO': trimmedTo,
-        'Train Type': trimmedType,
-    });
-
-    // One AudioClip check/creation per required field, tagged with the
-    // category that matches its role so it shows up right in the dashboard.
+// Make sure every audio key a train needs (from/to/name/type) exists in
+// AudioClip - as 'recorded' if it's already there, or freshly created as
+// 'pending' so it shows up in the recording queue if it's genuinely new.
+// Each one is tagged with the category matching its role for the dashboard.
+function ensureTrainAudio(fields) {
     const fieldsNeedingAudio = [
-        { key: trimmedFrom, category: 'Station Name' },
-        { key: trimmedTo, category: 'Station Name' },
+        { key: fields['FROM'], category: 'Station Name' },
+        { key: fields['TO'], category: 'Station Name' },
     ];
-    if (trimmedName) fieldsNeedingAudio.push({ key: trimmedName, category: 'Train Name' });
-    if (trimmedType) fieldsNeedingAudio.push({ key: trimmedType, category: 'Train Type' });
+    if (fields['Train Name']) fieldsNeedingAudio.push({ key: fields['Train Name'], category: 'Train Name' });
+    if (fields['Train Type']) fieldsNeedingAudio.push({ key: fields['Train Type'], category: 'Train Type' });
+    return Promise.all(fieldsNeedingAudio.map(({ key, category }) => ensureAudioClip(key, category)));
+}
 
-    const audioStatus = await Promise.all(
-        fieldsNeedingAudio.map(({ key, category }) => ensureAudioClip(key, category))
-    );
+// POST /api/trains - add a new train.
+router.post('/', async (req, res) => {
+    const { error, fields } = parseTrainBody(req.body);
+    if (error) return res.status(400).json({ error });
 
+    const existing = await Train.findOne({ 'Train No': fields['Train No'] });
+    if (existing) {
+        return res.status(409).json({ error: `Train ${fields['Train No']} already exists.` });
+    }
+
+    const train = await Train.create(fields);
+    const audioStatus = await ensureTrainAudio(fields);
     res.status(201).json({ train, audioStatus });
+});
+
+// PUT /api/trains/:trainNo - edit an existing train's number, route, name or
+// type. Changing the number is allowed as long as no other train has it.
+router.put('/:trainNo', async (req, res) => {
+    const currentNo = String(req.params.trainNo).trim();
+    const { error, fields } = parseTrainBody(req.body);
+    if (error) return res.status(400).json({ error });
+
+    const train = await Train.findOne({ 'Train No': currentNo });
+    if (!train) return res.status(404).json({ error: `Train ${currentNo} not found.` });
+
+    if (fields['Train No'] !== currentNo) {
+        const clash = await Train.findOne({ 'Train No': fields['Train No'] });
+        if (clash) return res.status(409).json({ error: `Train ${fields['Train No']} already exists.` });
+    }
+
+    try {
+        train.set(fields);
+        await train.save();
+        const audioStatus = await ensureTrainAudio(fields);
+        res.json({ train, audioStatus });
+    } catch (err) {
+        if (err.code === 11000) {
+            return res.status(409).json({ error: `Train ${fields['Train No']} already exists.` });
+        }
+        console.error(`Update failed for train ${currentNo}:`, err.message);
+        res.status(500).json({ error: 'Failed to update train.' });
+    }
 });
 
 module.exports = router;
