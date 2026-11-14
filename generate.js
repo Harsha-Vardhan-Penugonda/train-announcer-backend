@@ -70,13 +70,152 @@ function runFfmpeg(args) {
     });
 }
 
+// --- Spoken numbers ---
+// 0-9 are the digit clips used for train numbers. Telugu and English build
+// 21-59 from a tens clip plus a units clip (33 = "30" + "3"), so only 10-19
+// and the tens are recorded; Hindi numbers are each their own word, so every
+// one is recorded. A whole-number clip, if one exists, always wins (see
+// resolveItems) so a joined number that sounds choppy can be re-recorded.
+function numberOptions(n, lang) {
+    const whole = [`${n}_${lang}`];
+    if (n < 20 || n % 10 === 0 || lang === 'hin') return [whole];
+    return [whole, [`${n - (n % 10)}_${lang}`, `${n % 10}_${lang}`]];
+}
+
+// Time-of-day word for Telugu and Hindi, from the 24-hour expected hour.
+function dayPeriod(hour24) {
+    if (hour24 >= 4 && hour24 < 12) return { tel: 'tel_vudayam', hin: 'hin_subah' };
+    if (hour24 >= 12 && hour24 < 16) return { tel: 'tel_madhyahnam', hin: 'hin_dopahar' };
+    if (hour24 >= 16 && hour24 < 20) return { tel: 'tel_saayanthram', hin: 'hin_shaam' };
+    return { tel: 'tel_raathri', hin: 'hin_raat' };
+}
+
+const PLATFORM_TYPES = ['Arrive Shortly', 'Is On', 'Departing'];
+const LATE = 'Running Late';
+const CANCELLED = 'Cancelled';
+
+// Validates the type-specific inputs. Returns { error } or { late } where
+// late holds the parsed delay and expected time (null for other types).
+function parseInputs({ anncType, platformNumber, delayHours, delayMinutes, expectedTime }) {
+    if (PLATFORM_TYPES.includes(anncType)) {
+        if (!platformNumber || !String(platformNumber).trim()) return { error: 'Platform number is required.' };
+        return { late: null };
+    }
+    if (anncType === CANCELLED) return { late: null };
+    if (anncType !== LATE) return { error: `Unknown announcement type "${anncType}".` };
+
+    const h = Number(delayHours || 0), m = Number(delayMinutes || 0);
+    if (!Number.isInteger(h) || h < 0 || h > 23) return { error: 'Delay hours must be a whole number from 0 to 23.' };
+    if (!Number.isInteger(m) || m < 0 || m > 59) return { error: 'Delay minutes must be a whole number from 0 to 59.' };
+    if (h === 0 && m === 0) return { error: 'Enter how late the train is running.' };
+    const t = /^(\d{1,2}):(\d{2})$/.exec(String(expectedTime || '').trim());
+    if (!t || Number(t[1]) > 23 || Number(t[2]) > 59) return { error: 'Expected arrival time must look like 22:05.' };
+    return { late: { h, m, at24: Number(t[1]), atMin: Number(t[2]) } };
+}
+
+// Builds the announcement as a list of items. Each item is a list of
+// options, and each option a list of clip keys; the first option whose
+// clips all exist is used.
+function buildItems(details, anncType, platformNumber, late) {
+    const items = [];
+    const say = (...keys) => keys.forEach(k => items.push([[k]]));
+    const num = (n, lang) => items.push(numberOptions(n, lang));
+    const { trainNo, from, to, name, type } = details;
+
+    const common = (opening, lang) => {
+        say(opening);
+        String(trainNo).split('').forEach(ch => say(`${ch}_${lang}`));
+        say(from, to);
+        if (name) say(name);
+        if (type) say(type);
+    };
+
+    const hour12 = late ? (late.at24 % 12 || 12) : null;
+    const period = late ? dayPeriod(late.at24) : null;
+
+    // --- Telugu ---
+    common('daya_chesi', 'tel');
+    if (anncType === 'Arrive Shortly') { say('marikoddi'); say(`${platformNumber}_tel`, 'vacchunu'); }
+    else if (anncType === 'Is On') say(`${platformNumber}_tel`, 'vunnadi');
+    else if (anncType === 'Departing') say(`${platformNumber}_tel`, 'bayalderutaku');
+    else if (anncType === CANCELLED) say('tel_raddu', 'tel_regret');
+    else {
+        if (late.h) { num(late.h, 'tel'); say('tel_gantala'); }
+        if (late.m) { num(late.m, 'tel'); say('tel_nimishamulu'); }
+        say('tel_aalasyamuga', period.tel);
+        num(hour12, 'tel');
+        if (late.atMin) { say('tel_gantala'); num(late.atMin, 'tel'); say('tel_nimishamulaku'); }
+        else items.push([['tel_gantalaku'], ['tel_gantala']]);
+        say('tel_vacchunani', 'tel_regret');
+    }
+
+    // --- English ---
+    common('kindAttention', 'eng');
+    if (anncType === 'Arrive Shortly') say('willArive', `${platformNumber}_eng`);
+    else if (anncType === 'Is On') say('isOn', `${platformNumber}_eng`);
+    else if (anncType === 'Departing') say('isReadytoLeave', `${platformNumber}_eng`);
+    else if (anncType === CANCELLED) say('eng_cancelled', 'eng_regret');
+    else {
+        say('eng_runningLateBy');
+        if (late.h) { num(late.h, 'eng'); say(late.h === 1 ? 'eng_hour' : 'eng_hours'); }
+        if (late.h && late.m) say('eng_and');
+        if (late.m) { num(late.m, 'eng'); say(late.m === 1 ? 'eng_minute' : 'eng_minutes'); }
+        say('eng_expectedAt');
+        num(hour12, 'eng');
+        if (late.atMin > 0 && late.atMin < 10) say('eng_oh', `${late.atMin}_eng`);
+        else if (late.atMin) num(late.atMin, 'eng');
+        say(late.at24 < 12 ? 'eng_am' : 'eng_pm', 'eng_regret');
+    }
+
+    // --- Hindi ---
+    common('yaatrikan', 'hin');
+    if (anncType === 'Arrive Shortly') say('krmank', `${platformNumber}_hin`, 'parThodi');
+    else if (anncType === 'Is On') say('krmank', `${platformNumber}_hin`, 'ghadi');
+    else if (anncType === 'Departing') say('krmank', `${platformNumber}_hin`, 'ravana');
+    else if (anncType === CANCELLED) say('hin_radd', 'hin_regret');
+    else {
+        if (late.h) { num(late.h, 'hin'); say('hin_ghante'); }
+        if (late.m) { num(late.m, 'hin'); say('hin_minat'); }
+        say('hin_deri', period.hin);
+        num(hour12, 'hin');
+        say('hin_baje');
+        if (late.atMin) { num(late.atMin, 'hin'); say('hin_pahunchne'); }
+        else items.push([['hin_pahunchneOnly'], ['0_hin', 'hin_pahunchne']]);
+        say('hin_regret');
+    }
+    return items;
+}
+
+// Picks, for each item, the first option whose clips all resolve. Returns
+// the file paths in order plus the keys that couldn't be found.
+async function resolveItems(items) {
+    const cache = new Map();
+    const resolve = (key) => {
+        if (!cache.has(key)) cache.set(key, resolveAudioKey(key));
+        return cache.get(key);
+    };
+    const files = [], missing = [];
+    for (const options of items) {
+        let chosen = null;
+        for (const keys of options) {
+            const paths = await Promise.all(keys.map(resolve));
+            if (paths.every(Boolean)) { chosen = paths; break; }
+        }
+        if (chosen) files.push(...chosen);
+        else missing.push(options[options.length - 1].join(' + '));
+    }
+    return { files, missing };
+}
+
 // --- Main Announcement Generation Function ---
 const generateAnnouncement = async (req, res) => {
     const { trainNumber, platformNumber, anncType } = req.body;
 
-    if (!trainNumber || !platformNumber || !anncType) {
+    if (!trainNumber || !anncType) {
         return res.status(400).json({ error: "Missing required fields" });
     }
+    const { error: inputError, late } = parseInputs(req.body);
+    if (inputError) return res.status(400).json({ error: inputError });
 
     try {
         const trimmedTrainNumber = String(trainNumber).trim();
@@ -85,9 +224,6 @@ const generateAnnouncement = async (req, res) => {
         if (!trainDetails) {
             return res.status(404).json({ error: "Train not found in the database." });
         }
-
-        // --- Build the ordered list of audio keys (not paths yet) ---
-        const keys = [];
 
         const fromStation = trainDetails['FROM'];
         const toStation = trainDetails['TO'];
@@ -98,76 +234,25 @@ const generateAnnouncement = async (req, res) => {
              return res.status(500).json({ error: "Incomplete train data. Missing From/To." });
         }
 
-        // --- Telugu Announcement ---
-        keys.push('daya_chesi');
-        trimmedTrainNumber.split('').forEach(ch => keys.push(`${ch}_tel`));
-        keys.push(fromStation);
-        keys.push(toStation);
-        if (trainName) keys.push(trainName);
-        keys.push(trainType);
+        const platform = platformNumber ? String(platformNumber).trim() : null;
+        const items = buildItems(
+            { trainNo: trimmedTrainNumber, from: fromStation, to: toStation, name: trainName, type: trainType },
+            anncType, platform, late
+        );
+        const { files: validFiles, missing: missingKeys } = await resolveItems(items);
 
-        if (anncType === "Arrive Shortly") {
-            keys.push("marikoddi");
-            keys.push(`${platformNumber}_tel`);
-            keys.push("vacchunu");
-        } else if (anncType === "Is On") {
-            keys.push(`${platformNumber}_tel`);
-            keys.push("vunnadi");
-        } else { // Ready to Leave
-            keys.push(`${platformNumber}_tel`);
-            keys.push("bayalderutaku");
+        // The late/cancelled wording is all new clips - an announcement with
+        // some of them silently skipped would say something wrong, so refuse
+        // instead. The older types keep their skip-and-warn behaviour.
+        if (missingKeys.length && !PLATFORM_TYPES.includes(anncType)) {
+            return res.status(422).json({
+                error: `These clips haven't been recorded yet: ${[...new Set(missingKeys)].join(', ')}`,
+            });
         }
-
-        // --- English Announcement ---
-        keys.push('kindAttention');
-        trimmedTrainNumber.split('').forEach(ch => keys.push(`${ch}_eng`));
-        keys.push(fromStation);
-        keys.push(toStation);
-        if (trainName) keys.push(trainName);
-        if (trainType) keys.push(trainType);
-
-        if (anncType === "Arrive Shortly") {
-            keys.push("willArive");
-            keys.push(`${platformNumber}_eng`);
-        } else if (anncType === "Is On") {
-            keys.push("isOn");
-            keys.push(`${platformNumber}_eng`);
-        } else { // Ready to Leave
-            keys.push("isReadytoLeave");
-            keys.push(`${platformNumber}_eng`);
-        }
-
-        // --- Hindi Announcement ---
-        keys.push('yaatrikan');
-        trimmedTrainNumber.split('').forEach(ch => keys.push(`${ch}_hin`));
-        keys.push(fromStation);
-        keys.push(toStation);
-        if (trainName) keys.push(trainName);
-        if (trainType) keys.push(trainType);
-
-        if (anncType === "Arrive Shortly") {
-            keys.push("krmank");
-            keys.push(`${platformNumber}_hin`);
-            keys.push("parThodi");
-        } else if (anncType === "Is On") {
-            keys.push("krmank");
-            keys.push(`${platformNumber}_hin`);
-            keys.push("ghadi");
-        } else { // Ready to Leave
-            keys.push("krmank");
-            keys.push(`${platformNumber}_hin`);
-            keys.push("ravana");
-        }
-
-        // --- Resolve each key to a real file (MongoDB re-recording, else legacy disk file) ---
-        const resolved = await Promise.all(keys.map(async key => ({ key, filePath: await resolveAudioKey(key) })));
-
-        const missingKeys = resolved.filter(r => !r.filePath).map(r => r.key);
         if (missingKeys.length) {
             console.warn("Warning: no audio found (Mongo or disk) for these keys, they will be skipped:", missingKeys);
         }
 
-        const validFiles = resolved.filter(r => r.filePath).map(r => r.filePath);
         if (validFiles.length === 0) {
             return res.status(500).json({ error: "No audio available to build this announcement." });
         }
@@ -213,7 +298,7 @@ const generateAnnouncement = async (req, res) => {
             'FROM': fromStation,
             'TO': toStation,
             'Train Type': trainType,
-            platformNumber: platformNumber,
+            platformNumber: platform,
             announcementType: anncType,
             audioUrl: `/announcements/${outputFileName}`
         });
